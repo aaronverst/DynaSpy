@@ -1,5 +1,10 @@
 ﻿#include "DynaSpy.h"
-#include <WinNT.h>
+#include "args.hxx"
+#include <fstream>
+#include <functional>
+#include <numeric>
+#include <string>
+
 LPSTR win_strerror(DWORD errorID) {
   LPSTR error_str;
   size_t error_strlen = FormatMessageA(
@@ -11,7 +16,27 @@ LPSTR win_strerror(DWORD errorID) {
   return error_str;
 }
 
-#define declare(type, variable)                                                \
+TCHAR *filename_from_handle(HANDLE handle) {
+  TCHAR filename[MAX_PATH] = {
+      0,
+  };
+  DWORD result =
+      GetFinalPathNameByHandle(handle, filename, MAX_PATH, VOLUME_NAME_NT);
+  // See documentation. These are the two ways that GetFinalPathNameByHandle
+  // signals failure.
+  if (result == 0 || result > MAX_PATH) {
+    return nullptr;
+  }
+  TCHAR *result_filename = (TCHAR *)calloc(sizeof(TCHAR), result + 1);
+  // Very defensive. calloc() could return 0.
+  if (result_filename == nullptr) {
+    return nullptr;
+  }
+  strncat(result_filename, filename, result);
+  return result_filename;
+}
+
+#define zero_declare(type, variable)                                           \
   type variable;                                                               \
   memset(&variable, 0, sizeof(type));
 
@@ -22,27 +47,56 @@ LPSTR win_strerror(DWORD errorID) {
 
 int main(int argc, char *argv[]) {
 
-  bool debug = true;
-
-  if (argc < 2) {
-    usage(argv[0]);
+  args::ArgumentParser parser(
+      "Log the DLLs that are dynamically loaded at runtime.");
+  args::HelpFlag help(parser, "help", "Display this help menu", {'h', "help"});
+  args::Flag debug(parser, "debug", "Enable debugging.", {"d", "debug"});
+  args::ValueFlag<std::string> outfilename(
+      parser, "outfile", "Store output to a file", {"o", "outfile"});
+  args::Positional<std::string> mark_name(parser, "mark_name",
+                                          "The mark program to execute.",
+                                          args::Options::Required);
+  args::PositionalList<std::string> mark_commandline(
+      parser, "arguments", "The arguments for the mark program.");
+  try {
+    parser.ParseCLI(argc, argv);
+  } catch (args::Help) {
+    std::cout << parser;
+    return 0;
+  } catch (args::ParseError e) {
+    std::cerr << e.what() << std::endl;
+    std::cerr << parser;
+    return 1;
+  } catch (args::ValidationError e) {
+    std::cerr << e.what() << std::endl;
+    std::cerr << parser;
+    return 1;
   }
 
-  int child_process_count = 0;
+  std::ofstream outfile;
+  if (outfilename.Get() != "") {
+    outfile.open(outfilename.Get(), std::ios_base::trunc);
+    if (!outfile.is_open()) {
+      std::cerr << "Could not open output file named " << outfilename.Get()
+                << "!\n";
+      exit(1);
+    }
+  }
+  std::ostream &outputter = outfilename.Get() != "" ? outfile : std::cout;
 
-  LPCSTR mark_name = argv[1];
-  // LPCSTR mark_name = "./HelloWorld.exe";
-  LPSTR mark_commandline = argv[2];
-  // LPSTR mark_commandline = nullptr;
-
-  declare(PROCESS_INFORMATION, mark_processinformation);
-  declare(STARTUPINFO, mark_processstartupinfo);
+  zero_declare(PROCESS_INFORMATION, mark_processinformation);
+  zero_declare(STARTUPINFO, mark_processstartupinfo);
   HANDLE mark_imagehandle = nullptr;
 
+  std::string complete_commandline = std::accumulate(
+      mark_commandline.Get().begin(), mark_commandline.Get().end(),
+      "\"" + mark_name.Get() + "\"",
+      [](std::string a, std::string b) { return a + " " + b; });
+
   bool create_result = CreateProcessA(
-      mark_name, mark_commandline, NULL, NULL, FALSE, DEBUG_ONLY_THIS_PROCESS,
-      NULL, NULL, (LPSTARTUPINFOA)(&mark_processstartupinfo),
-      &mark_processinformation);
+      mark_name.Get().c_str(), const_cast<char *>(complete_commandline.c_str()),
+      NULL, NULL, FALSE, DEBUG_ONLY_THIS_PROCESS, NULL, NULL,
+      (LPSTARTUPINFOA)(&mark_processstartupinfo), &mark_processinformation);
 
   if (!create_result) {
     std::cout << "Did not launch mark process with path " << mark_name
@@ -62,7 +116,7 @@ int main(int argc, char *argv[]) {
   CloseHandle(mark_processinformation.hThread);
 
   for (;;) {
-    declare(DEBUG_EVENT, debugEvent);
+    zero_declare(DEBUG_EVENT, debugEvent);
 
     WaitForDebugEvent(&debugEvent, INFINITE);
 
@@ -79,9 +133,8 @@ int main(int argc, char *argv[]) {
       break;
     }
     case CREATE_PROCESS_DEBUG_EVENT: {
-      child_process_count++;
       if (debug) {
-        std::cout << "Process being created (" << child_process_count << ")!\n";
+        std::cout << "Process being created!\n";
       }
 
       // Store the handle because we will want to close it when we are done
@@ -112,14 +165,16 @@ int main(int argc, char *argv[]) {
       if (debug) {
         std::cout << "Loading a dll!\n";
       }
+      TCHAR *dll_name = filename_from_handle(debugEvent.u.LoadDll.hFile);
 
-      TCHAR dll_name[MAX_PATH] = {
-          0,
-      };
-      // TODO: This may not work. Check the return value before moving on!
-      GetFinalPathNameByHandle(debugEvent.u.LoadDll.hFile, dll_name, MAX_PATH,
-                               VOLUME_NAME_NT);
-      std::cout << "Loaded a DLL named: " << dll_name << "\n";
+      if (dll_name != nullptr) {
+        outputter << mark_name.Get() << " loaded a DLL named " << dll_name
+                  << "\n";
+        free(dll_name);
+      } else {
+        outputter << mark_name.Get()
+                  << " loaded a DLL but could not decipher its filename!\n";
+      }
       CloseHandle(debugEvent.u.LoadDll.hFile);
       break;
     }
@@ -143,5 +198,8 @@ int main(int argc, char *argv[]) {
   if (mark_imagehandle) {
     CloseHandle(mark_imagehandle);
   }
+
+  // In case we are outputing to a file, do a flush!
+  outputter << std::flush;
   return 0;
 }
