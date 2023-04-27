@@ -1,12 +1,16 @@
 ﻿#include "DynaSpy.h"
 
+#include <tchar.h>
+
 #include <fstream>
 #include <functional>
 #include <numeric>
 #include <string>
+#include <vector>
 
 #include "args.hxx"
 
+using namespace std;
 /** A Windows version of strerror(3).
  *
  * @param errorID The error number from which to find a
@@ -64,16 +68,25 @@ TCHAR *filename_from_handle(HANDLE handle) {
 }
 
 int main(int argc, char *argv[]) {
+  vector<string> myVector{};
+  ifstream in("dll_threat.txt");
+  string file1;
+  while (in >> file1) {
+    myVector.push_back(file1);
+    cout << "\n" << file1 << "\n";
+  }
+  in.close();
+
   args::ArgumentParser parser(
       "Log the DLLs that are dynamically loaded at runtime.");
   args::HelpFlag help(parser, "help", "Display this help menu", {'h', "help"});
   args::Flag debug(parser, "debug", "Enable debugging.", {"d", "debug"});
-  args::ValueFlag<std::string> outfilename(
+  args::ValueFlag<string> outfilename(
       parser, "outfile", "Store output to a file", {"o", "outfile"});
-  args::Positional<std::string> mark_name(parser, "mark_name",
-                                          "The mark program to execute.",
-                                          args::Options::Required);
-  args::PositionalList<std::string> mark_commandline(
+  args::Positional<string> mark_name(parser, "mark_name",
+                                     "The mark program to execute.",
+                                     args::Options::Required);
+  args::PositionalList<string> mark_commandline(
       parser, "arguments", "The arguments for the mark program.");
   try {
     parser.ParseCLI(argc, argv);
@@ -81,12 +94,12 @@ int main(int argc, char *argv[]) {
     std::cout << parser;
     return 0;
   } catch (args::ParseError e) {
-    std::cerr << e.what() << std::endl;
-    std::cerr << parser;
+    cerr << e.what() << std::endl;
+    cerr << parser;
     return 1;
   } catch (args::ValidationError e) {
-    std::cerr << e.what() << std::endl;
-    std::cerr << parser;
+    cerr << e.what() << std::endl;
+    cerr << parser;
     return 1;
   }
 
@@ -203,6 +216,15 @@ int main(int argc, char *argv[]) {
         if (dll_filename != nullptr) {
           outputter << mark_name.Get() << " loaded a DLL named " << dll_filename
                     << "\n";
+          string dll_filename_str = string(dll_filename);
+          string base_filename =
+              dll_filename_str.substr(dll_filename_str.find_last_of("/\\") + 1);
+          for (int i = 0; i < myVector.size(); i++) {
+            if (base_filename == myVector[i]) {
+              outputter << "\nWARNING!!!!!: " << dll_filename
+                        << " is a known threat!\n \n";
+            }
+          }
           free(dll_filename);
         } else {
           outputter << mark_name.Get()
